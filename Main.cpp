@@ -8,6 +8,377 @@
 
 #define BASENAME TJS_W("var")
 
+class MemoryIStream : public IStream
+{
+protected:
+	void * Block;
+	bool Reference;
+	tjs_uint Size;
+	tjs_uint AllocSize;
+	tjs_uint CurrentPos;
+private:
+	ULONG RefCount;
+
+public:
+	MemoryIStream();
+	MemoryIStream(const void * block, tjs_uint size);
+	~MemoryIStream();
+
+
+	// IUnknown
+	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+		void **ppvObject);
+	ULONG STDMETHODCALLTYPE AddRef(void);
+	ULONG STDMETHODCALLTYPE Release(void);
+
+	// ISequentialStream
+	HRESULT STDMETHODCALLTYPE Read(void *pv, ULONG cb, ULONG *pcbRead);
+	HRESULT STDMETHODCALLTYPE Write(const void *pv, ULONG cb,
+		ULONG *pcbWritten);
+
+	// IStream
+	HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER dlibMove,
+		DWORD dwOrigin, ULARGE_INTEGER *plibNewPosition);
+	HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER libNewSize);
+	HRESULT STDMETHODCALLTYPE CopyTo(IStream *pstm, ULARGE_INTEGER cb,
+		ULARGE_INTEGER *pcbRead, ULARGE_INTEGER *pcbWritten);
+	HRESULT STDMETHODCALLTYPE Commit(DWORD grfCommitFlags);
+	HRESULT STDMETHODCALLTYPE Revert(void);
+	HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER libOffset,
+		ULARGE_INTEGER cb, DWORD dwLockType);
+	HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER libOffset,
+		ULARGE_INTEGER cb, DWORD dwLockType);
+	HRESULT STDMETHODCALLTYPE Stat(STATSTG *pstatstg, DWORD grfStatFlag);
+	HRESULT STDMETHODCALLTYPE Clone(IStream **ppstm);
+
+	// non-IStream based methods
+	void * GetInternalBuffer()  const { return Block; }
+	void Clear(void);
+	void SetSize(tjs_uint size);
+
+protected:
+	void Init();
+
+protected:
+	virtual void * Alloc(size_t size);
+	virtual void * Realloc(void *orgblock, size_t size);
+	virtual void Free(void *block);
+};
+//---------------------------------------------------------------------------
+MemoryIStream::MemoryIStream()
+{
+	RefCount = 1;
+	Init();
+}
+//---------------------------------------------------------------------------
+MemoryIStream::MemoryIStream(const void * block, tjs_uint size)
+{
+	RefCount = 1;
+	Init();
+	Block = (void*)block;
+	if(!Block)
+	{
+		Block = Alloc(size);
+		if(!Block) TVPThrowExceptionMessage(TJS_W("Cannot allocate memory"));
+	}
+	else
+	{
+		Reference = true; // memory block was given
+	}
+	Size = size;
+	AllocSize = size;
+	CurrentPos = 0;
+}
+//---------------------------------------------------------------------------
+MemoryIStream::~MemoryIStream()
+{
+	if(Block && !Reference) Free(Block);
+}
+//---------------------------------------------------------------------------
+HRESULT STDMETHODCALLTYPE MemoryIStream::QueryInterface(REFIID riid,
+		void **ppvObject)
+{
+	if(!ppvObject) return E_INVALIDARG;
+
+	*ppvObject=NULL;
+	if(!memcmp(&riid,&IID_IUnknown,16))
+		*ppvObject=(IUnknown*)this;
+	else if(!memcmp(&riid,&IID_ISequentialStream,16))
+		*ppvObject=(ISequentialStream*)this;
+	else if(!memcmp(&riid,&IID_IStream,16))
+		*ppvObject=(IStream*)this;
+
+	if(*ppvObject)
+	{
+		AddRef();
+		return S_OK;
+	}
+	return E_NOINTERFACE;
+}
+//---------------------------------------------------------------------------
+ULONG STDMETHODCALLTYPE MemoryIStream::AddRef(void)
+{
+	return ++ RefCount;
+}
+//---------------------------------------------------------------------------
+ULONG STDMETHODCALLTYPE MemoryIStream::Release(void)
+{
+	if(RefCount == 1)
+	{
+		delete this;
+		return 0;
+	}
+	else
+	{
+		return --RefCount;
+	}
+}
+//---------------------------------------------------------------------------
+HRESULT STDMETHODCALLTYPE MemoryIStream::Read(void *pv, ULONG cb, ULONG *pcbRead)
+{
+	if(CurrentPos + cb >= Size)
+	{
+		cb = Size - CurrentPos;
+	}
+
+	memcpy(pv, (tjs_uint8*)Block + CurrentPos, cb);
+
+	CurrentPos += cb;
+
+	if (pcbRead)
+	{
+		*pcbRead = cb;
+	}
+	return S_OK;
+}
+//---------------------------------------------------------------------------
+HRESULT STDMETHODCALLTYPE MemoryIStream::Write(const void *pv, ULONG cb,
+		ULONG *pcbWritten)
+{
+	// writing may increase the internal buffer size.
+	if(Reference) return E_FAIL;
+
+	tjs_uint newpos = CurrentPos + cb;
+	if(newpos >= AllocSize)
+	{
+		// exceeds AllocSize
+		tjs_uint onesize;
+		if(AllocSize < 64*1024) onesize = 4*1024;
+		else if(AllocSize < 512*1024) onesize = 16*1024;
+		else if(AllocSize < 4096*1024) onesize = 256*1024;
+		else onesize = 2024*1024;
+		AllocSize += onesize;
+
+		if(CurrentPos + cb >= AllocSize) // still insufficient ?
+		{
+			AllocSize = CurrentPos + cb;
+		}
+
+		Block = Realloc(Block, AllocSize);
+
+		if(AllocSize && !Block)
+			return E_OUTOFMEMORY;
+			// this exception cannot be repaird; a fatal error.
+	}
+
+	memcpy((tjs_uint8*)Block + CurrentPos, pv, cb);
+
+	CurrentPos = newpos;
+
+	if(CurrentPos > Size) Size = CurrentPos;
+
+	if (pcbWritten)
+	{
+		*pcbWritten = cb;
+	}
+	return S_OK;
+}
+//---------------------------------------------------------------------------
+HRESULT STDMETHODCALLTYPE MemoryIStream::Seek(LARGE_INTEGER dlibMove,
+	DWORD dwOrigin, ULARGE_INTEGER *plibNewPosition)
+{
+	tjs_int64 newpos;
+	switch(dwOrigin)
+	{
+	case STREAM_SEEK_SET:
+		if(dlibMove.QuadPart >= 0)
+		{
+			if(dlibMove.QuadPart <= Size) CurrentPos = static_cast<tjs_uint>(dlibMove.QuadPart);
+		}
+		break;
+
+	case STREAM_SEEK_CUR:
+		if((newpos = dlibMove.QuadPart + (tjs_int64)CurrentPos) >= 0)
+		{
+			tjs_uint np = (tjs_uint)newpos;
+			if(np <= Size) CurrentPos = np;
+		}
+		break;
+
+	case STREAM_SEEK_END:
+		if((newpos = dlibMove.QuadPart + (tjs_int64)Size) >= 0)
+		{
+			tjs_uint np = (tjs_uint)newpos;
+			if(np <= Size) CurrentPos = np;
+		}
+		break;
+	default:
+		return E_FAIL;
+	}
+	if (plibNewPosition)
+	{
+		(*plibNewPosition).QuadPart = CurrentPos;
+	}
+	return S_OK;
+}
+//---------------------------------------------------------------------------
+HRESULT STDMETHODCALLTYPE MemoryIStream::SetSize(ULARGE_INTEGER libNewSize)
+{
+	return E_NOTIMPL;
+}
+//---------------------------------------------------------------------------
+HRESULT STDMETHODCALLTYPE MemoryIStream::CopyTo(IStream *pstm, ULARGE_INTEGER cb,
+	ULARGE_INTEGER *pcbRead, ULARGE_INTEGER *pcbWritten)
+{
+	return E_NOTIMPL;
+}
+//---------------------------------------------------------------------------
+HRESULT STDMETHODCALLTYPE MemoryIStream::Commit(DWORD grfCommitFlags)
+{
+	return E_NOTIMPL;
+}
+//---------------------------------------------------------------------------
+HRESULT STDMETHODCALLTYPE MemoryIStream::Revert(void)
+{
+	return E_NOTIMPL;
+}
+//---------------------------------------------------------------------------
+HRESULT STDMETHODCALLTYPE MemoryIStream::LockRegion(ULARGE_INTEGER libOffset,
+	ULARGE_INTEGER cb, DWORD dwLockType)
+{
+	return E_NOTIMPL;
+}
+//---------------------------------------------------------------------------
+HRESULT STDMETHODCALLTYPE MemoryIStream::UnlockRegion(ULARGE_INTEGER libOffset,
+	ULARGE_INTEGER cb, DWORD dwLockType)
+{
+	return E_NOTIMPL;
+}
+//---------------------------------------------------------------------------
+HRESULT STDMETHODCALLTYPE MemoryIStream::Stat(STATSTG *pstatstg, DWORD grfStatFlag)
+{
+	// This method imcompletely fills the target structure, because some
+	// informations like access mode or stream name are already lost
+	// at this point.
+
+	if(pstatstg)
+	{
+		memset(pstatstg, 0, sizeof(*pstatstg));
+
+#if 0
+		// pwcsName
+		// this object's storage pointer does not have a name ...
+		if(!(grfStatFlag &  STATFLAG_NONAME))
+		{
+			// anyway returns an empty string
+			LPWSTR str = (LPWSTR)CoTaskMemAlloc(sizeof(*str));
+			if(str == NULL) return E_OUTOFMEMORY;
+			*str = TJS_W('\0');
+			pstatstg->pwcsName = str;
+		}
+#endif
+
+		// type
+		pstatstg->type = STGTY_STREAM;
+
+		// cbSize
+		pstatstg->cbSize.QuadPart = Size;
+
+		// mtime, ctime, atime unknown
+
+		// grfMode unknown
+		pstatstg->grfMode = STGM_DIRECT | STGM_READWRITE | STGM_SHARE_DENY_WRITE ;
+			// Note that this method always returns flags above, regardless of the
+			// actual mode.
+			// In the return value, the stream is to be indicated that the
+			// stream can be written, but of cource, the Write method will fail
+			// if the stream is read-only.
+
+		// grfLockSuppoted
+		pstatstg->grfLocksSupported = 0;
+
+		// grfStatBits unknown
+	}
+	else
+	{
+		return E_INVALIDARG;
+	}
+
+	return S_OK;
+}
+//---------------------------------------------------------------------------
+HRESULT STDMETHODCALLTYPE MemoryIStream::Clone(IStream **ppstm)
+{
+	return E_NOTIMPL;
+}
+//---------------------------------------------------------------------------
+void MemoryIStream::Clear(void)
+{
+	if(Block && !Reference) Free(Block);
+	Init();
+}
+//---------------------------------------------------------------------------
+void MemoryIStream::SetSize(tjs_uint size)
+{
+	if(Reference) TVPThrowExceptionMessage(TJS_W("Write error"));
+
+	if(Size > size)
+	{
+		// decrease
+		Size = size;
+		AllocSize = size;
+		Block = Realloc(Block, size);
+		if(CurrentPos > Size) CurrentPos = Size;
+		if(size && !Block)
+			TVPThrowExceptionMessage(TJS_W("Cannot allocate memory"));
+	}
+	else
+	{
+		// increase
+		AllocSize = size;
+		Size = size;
+		Block = Realloc(Block, size);
+		if(size && !Block)
+			TVPThrowExceptionMessage(TJS_W("Cannot allocate memory"));
+
+	}
+}
+//---------------------------------------------------------------------------
+void MemoryIStream::Init()
+{
+	Block = NULL;
+	Reference = false;
+	Size = 0;
+	AllocSize = 0;
+	CurrentPos = 0;
+}
+//---------------------------------------------------------------------------
+void * MemoryIStream::Alloc(size_t size)
+{
+	return malloc(size);
+}
+//---------------------------------------------------------------------------
+void * MemoryIStream::Realloc(void *orgblock, size_t size)
+{
+	return realloc(orgblock, size);
+}
+//---------------------------------------------------------------------------
+void MemoryIStream::Free(void *block)
+{
+	free(block);
+}
+//---------------------------------------------------------------------------
+
 // 辞書かどうかの判定
 static bool isDirectory(tTJSVariant &base) {
 	return base.Type() == tvtObject && base.AsObjectNoAddRef() != NULL;
@@ -21,13 +392,21 @@ static bool isFile(tTJSVariant &file) {
 /**
  * Variant参照型ストリーム
  */
-class VariantStream : public tTJSBinaryStream {
+class VariantStream : public IStream {
 
 public:
 	/**
 	 * コンストラクタ
 	 */
-	VariantStream(tTJSVariant &parent) : refCount(1), parent(parent), stream(0), cur(0) {};
+	VariantStream(tTJSVariant &parent) : 
+		refCount(1),
+		parent(parent),
+#if 0
+		hBuffer(0),
+#endif
+		stream(0),
+		cur(0)
+		{};
 
 	/**
 	 * ファイルを開く
@@ -51,26 +430,21 @@ public:
 			return false;
 		}
 #endif
-		stream = new tTVPMemoryStream();
+		stream = new MemoryIStream();
 
 		// オブジェクトの内容を複製
 		if (flags == TJS_BS_UPDATE || flags == TJS_BS_APPEND) {
 			parent.AsObjectClosureNoAddRef().PropGet(0, name.c_str(), NULL, &value, NULL);
 			if (isFile(value)) {
-#if 0
 				stream->Write(value.AsOctetNoAddRef()->GetData(), value.AsOctetNoAddRef()->GetLength(), NULL);
 				LARGE_INTEGER n;
 				n.QuadPart = 0;
 				stream->Seek(n, flags == TJS_BS_UPDATE ? STREAM_SEEK_SET : STREAM_SEEK_END, NULL);
-#endif
-				stream->Write(value.AsOctetNoAddRef()->GetData(), value.AsOctetNoAddRef()->GetLength());
-				stream->Seek(0, flags == TJS_BS_UPDATE ? TJS_BS_SEEK_SET : TJS_BS_SEEK_END);
 			}
 		}
 		return true;
 	}
 	
-#if 0
 	// IUnknown
 	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) {
 		if (riid == IID_IUnknown || riid == IID_ISequentialStream || riid == IID_IStream) {
@@ -98,66 +472,65 @@ public:
 		}
 		return ret;
 	}
-#endif
 
 	// ISequentialStream
-	virtual tjs_uint TJS_INTF_METHOD Read(void *pv, tjs_uint cb) {
+	HRESULT STDMETHODCALLTYPE Read(void *pv, ULONG cb, ULONG *pcbRead) {
 		if (stream) {
-			return stream->Read(pv, cb);
+			return stream->Read(pv, cb, pcbRead);
 		} else {
 			const tjs_uint8 *base = getBase();
 			tTVInteger size = getSize() - cur;
 			if (base && cb > 0 && size > 0) {
 				if (cb > size) {
-					cb = size;
+					cb = (ULONG)size;
 				}
 				memcpy(pv, base + cur, cb);
 				cur += cb;
-				return cb;
+				if (pcbRead) {
+					*pcbRead = cb;
+				}
+				return S_OK;
 			} else {
-				return 0;
+				if (pcbRead) {
+					*pcbRead = 0;
+				}
+				return S_FALSE;
 			}
 		}
 	}
 
-	virtual tjs_uint TJS_INTF_METHOD Write(const void *pv, tjs_uint cb) {
+	HRESULT STDMETHODCALLTYPE Write(const void *pv, ULONG cb, ULONG *pcbWritten) {
 		if (stream) {
-			return stream->Write(pv, cb);
+			return stream->Write(pv, cb, pcbWritten);
 		} else {
-			return 0;
+			return E_NOTIMPL;
 		}
 	}
 
 	// IStream
-	virtual tjs_uint64 TJS_INTF_METHOD Seek(tjs_int64 dlibMove, tjs_int dwOrigin) {
+	HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER dlibMove,	DWORD dwOrigin, ULARGE_INTEGER *plibNewPosition) {
 		if (stream) {
-			return stream->Seek(dlibMove, dwOrigin);
+			return stream->Seek(dlibMove, dwOrigin, plibNewPosition);
 		} else {
 			switch (dwOrigin) {
-			case TJS_BS_SEEK_CUR:
-				cur += dlibMove;
+			case STREAM_SEEK_CUR:
+				cur += dlibMove.QuadPart;
 				break;
-			case TJS_BS_SEEK_SET:
-				cur = dlibMove;
+			case STREAM_SEEK_SET:
+				cur = dlibMove.QuadPart;
 				break;
-			case TJS_BS_SEEK_END:
+			case STREAM_SEEK_END:
 				cur = getSize();
-				cur += dlibMove;
+				cur += dlibMove.QuadPart;
 				break;
 			}
-			return cur;
+			if (plibNewPosition) {
+				plibNewPosition->QuadPart = cur;
+			}
+			return S_OK;
 		}
 	}
-
-	virtual tjs_uint64 TJS_INTF_METHOD GetSize() {
-		if (stream) {
-			return stream->GetSize();
-		} else {
-			return getSize();
-		}
-	}
-
-#if 0
+	
 	HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER libNewSize) {
 		return stream ? stream ->SetSize(libNewSize) : E_NOTIMPL;
 	}
@@ -189,7 +562,6 @@ public:
 	HRESULT STDMETHODCALLTYPE Clone(IStream **ppstm) {
 		return stream ? stream->Clone(ppstm) : E_NOTIMPL;
 	}
-#endif
 
 protected:
 
@@ -198,12 +570,21 @@ protected:
 	 */
 	void close() {
 		if (stream) {
-#if 0
-			stream->Release();
+#if 1
+			if (name != "") {
+				unsigned char* pBuffer = (unsigned char*)stream->GetInternalBuffer();
+				if (pBuffer) {
+					HRESULT hr;
+					STATSTG stg;
+
+					hr = stream->Stat(&stg, STATFLAG_NONAME);
+
+					value = tTJSVariant(pBuffer, stg.cbSize.QuadPart);
+					parent.AsObjectClosureNoAddRef().PropSet(TJS_MEMBERENSURE, name.c_str(), NULL, &value, NULL);
+				}
+			}
 #endif
-			value = tTJSVariant((const tjs_uint8*)stream->GetInternalBuffer(), stream->GetSize());
-			parent.AsObjectClosureNoAddRef().PropSet(TJS_MEMBERENSURE, name.c_str(), NULL, &value, NULL);
-			delete stream;
+			stream->Release();
 			stream = NULL;
 		}
 #if 0
@@ -225,7 +606,6 @@ protected:
 		cur = 0;
 	}
 
-public:
     /**
 	 * デストラクタ
 	 */
@@ -233,14 +613,13 @@ public:
 		close();
 	}
 
-protected:
 	// 読み込み用メモリ領域取得
 	const tjs_uint8 *getBase() {
 		return isFile(value) ? value.AsOctetNoAddRef()->GetData() : NULL;
 	}
 
 	// 読み込み用メモリサイズ取得
-	virtual tjs_uint64 TJS_INTF_METHOD getSize() {
+	tTVInteger getSize() {
 		return isFile(value) ? value.AsOctetNoAddRef()->GetLength() : 0;
 	}
 
@@ -249,7 +628,10 @@ private:
 	tTJSVariant parent;
 	ttstr name;
 	tTJSVariant value;
-	tTVPMemoryStream *stream;
+#if 0
+	HGLOBAL hBuffer;
+#endif
+	MemoryIStream *stream;
 	tTVInteger cur;
 };
 
@@ -355,10 +737,11 @@ public:
 		tTJSVariant parent = getParentName(name, fname);
 		if (isDirectory(parent) && fname.length() > 0) {
 			VariantStream *stream = new VariantStream(parent);
-			if (!stream->open(fname, flags)) {
-				delete stream;
-			} else {
-				ret = stream;
+			if (stream) {
+				if (stream->open(fname, flags)) {
+					ret = TVPCreateBinaryStreamAdapter(stream);
+				}
+				stream->Release();
 			}
 		}
 		if (!ret) {
